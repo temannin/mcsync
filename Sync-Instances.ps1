@@ -6,8 +6,9 @@ param(
     [switch]$DryRun
 )
 
-$textExts = @('.json', '.cfg', '.ini', '.toml', '.properties', '.txt', '.xml', '.yaml', '.yml', '.md')
-$log      = "$PSScriptRoot\sync.log"
+Import-Module "$PSScriptRoot\McSync.psm1" -Force
+
+$log = "$PSScriptRoot\sync.log"
 function Log($msg) { $msg | Add-Content $log }
 
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]$(if ($DryRun) { ' [DryRun]' })" | Set-Content $log
@@ -17,37 +18,18 @@ $session = New-PSSession -ComputerName $RemoteHost -Credential $cred
 
 try {
     Log "Indexing local files..."
-    $localIndex = @{}
+    $localIndex = Get-FileIndex -Path $LocalPath
     $localSizes = @{}
     Get-ChildItem -Path $LocalPath -Recurse -File | ForEach-Object {
-        $rel = $_.FullName.Substring($LocalPath.Length).TrimStart('\')
-        $localSizes[$rel] = $_.Length
-        $localIndex[$rel] = if ($textExts -contains $_.Extension.ToLower()) {
-            (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
-        } else {
-            $_.Length
-        }
+        $localSizes[$_.FullName.Substring($LocalPath.Length).TrimStart('\')] = $_.Length
     }
 
     Log "Indexing remote files..."
-    $remoteIndex = Invoke-Command -Session $session -ScriptBlock {
-        param($path)
-        $index = @{}
-        if (Test-Path $path) {
-            Get-ChildItem -Path $path -Recurse -File | ForEach-Object {
-                $rel = $_.FullName.Substring($path.Length).TrimStart('\')
-                $index[$rel] = if ($using:textExts -contains $_.Extension.ToLower()) {
-                    (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
-                } else {
-                    $_.Length
-                }
-            }
-        }
-        $index
-    } -ArgumentList $RemotePath
+    $remoteIndex = Invoke-Command -Session $session -ScriptBlock ${Function:Get-FileIndex} -ArgumentList $RemotePath
 
-    $toCopy   = @($localIndex.Keys  | Where-Object { -not $remoteIndex.ContainsKey($_) -or $remoteIndex[$_] -ne $localIndex[$_] })
-    $toDelete = @($remoteIndex.Keys | Where-Object { -not $localIndex.ContainsKey($_) })
+    $diff     = Get-SyncDiff -LocalIndex $localIndex -RemoteIndex $remoteIndex
+    $toCopy   = $diff.ToCopy
+    $toDelete = $diff.ToDelete
 
     $totalMB = [math]::Round(($toCopy | ForEach-Object { $localSizes[$_] } | Measure-Object -Sum).Sum / 1MB, 2)
     Log "$($toCopy.Count) file(s) to copy ($totalMB MB), $($toDelete.Count) to remove."
@@ -77,21 +59,12 @@ try {
             $remoteZip = Join-Path $remoteTmp "_mcsync.zip"
             Copy-Item -Path $zipPath -Destination $remoteZip -ToSession $session -Force
 
-            $instanceCfgs = @($toCopy | Where-Object { (Split-Path $_ -Leaf) -eq 'instance.cfg' })
+            $instanceCfgs    = @($toCopy | Where-Object { (Split-Path $_ -Leaf) -eq 'instance.cfg' })
             $remoteJavaPaths = @{}
             if ($instanceCfgs.Count -gt 0) {
-                $remoteJavaPaths = Invoke-Command -Session $session -ScriptBlock {
-                    param($path, $rels)
-                    $result = @{}
-                    foreach ($rel in $rels) {
-                        $full = Join-Path $path $rel
-                        if (Test-Path $full) {
-                            $line = Get-Content $full | Where-Object { $_ -match '^JavaPath=' } | Select-Object -First 1
-                            if ($line) { $result[$rel] = $line }
-                        }
-                    }
-                    $result
-                } -ArgumentList $RemotePath, $instanceCfgs
+                $remoteJavaPaths = Invoke-Command -Session $session `
+                    -ScriptBlock ${Function:Get-InstanceJavaPaths} `
+                    -ArgumentList $RemotePath, $instanceCfgs
             }
 
             Log "Extracting on remote..."
@@ -103,23 +76,9 @@ try {
             } -ArgumentList $remoteZip, $RemotePath
 
             if ($remoteJavaPaths.Count -gt 0) {
-                Invoke-Command -Session $session -ScriptBlock {
-                    param($path, $javaPaths)
-                    foreach ($rel in $javaPaths.Keys) {
-                        $full = Join-Path $path $rel
-                        if (Test-Path $full) {
-                            $lines = [System.Collections.Generic.List[string]](Get-Content $full | Where-Object { $_ -notmatch '^JavaPath=' })
-                            $generalIdx = $lines.IndexOf('[General]')
-                            if ($generalIdx -ge 0) {
-                                $lines.Insert($generalIdx + 1, $javaPaths[$rel])
-                            } else {
-                                $lines.Add('[General]')
-                                $lines.Add($javaPaths[$rel])
-                            }
-                            $lines | Set-Content $full
-                        }
-                    }
-                } -ArgumentList $RemotePath, $remoteJavaPaths
+                Invoke-Command -Session $session `
+                    -ScriptBlock ${Function:Restore-InstanceJavaPaths} `
+                    -ArgumentList $RemotePath, $remoteJavaPaths
             }
         } finally {
             Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -132,7 +91,7 @@ try {
         Invoke-Command -Session $session -ScriptBlock {
             param($files)
             foreach ($f in $files) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
-        } -ArgumentList (,$remoteToDelete)
+        } -ArgumentList (, $remoteToDelete)
     }
 } finally {
     Remove-PSSession $session
